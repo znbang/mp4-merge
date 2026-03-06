@@ -6,7 +6,7 @@ import (
 	"io"
 )
 
-func rewriteFromDesc(files []*fileHandle, output io.ReadWriteSeeker, d *desc, track int, maxRead uint64) (uint64, error) {
+func rewriteFromDesc(files []*fileHandle, output io.WriteSeeker, d *desc, track int, maxRead uint64) (uint64, error) {
 	var totalRead, totalNew uint64
 	tlTrack := track
 	first := files[0].stream
@@ -343,7 +343,7 @@ func rewriteFromDesc(files []*fileHandle, output io.ReadWriteSeeker, d *desc, tr
 	return totalNew, nil
 }
 
-func patchUint32(w io.ReadWriteSeeker, position int64, value uint32) error {
+func patchUint32(w io.WriteSeeker, position int64, value uint32) error {
 	current, err := w.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return err
@@ -358,7 +358,7 @@ func patchUint32(w io.ReadWriteSeeker, position int64, value uint32) error {
 	return err
 }
 
-func patchUint64(w io.ReadWriteSeeker, position int64, value uint64) error {
+func patchUint64(w io.WriteSeeker, position int64, value uint64) error {
 	current, err := w.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return err

@@ -47,14 +47,19 @@ func JoinFiles(paths []string, outputPath string, progress func(float64)) error 
 	}
 	defer out.Close()
 
-	if err := JoinFileStreams(handles, out, progress); err != nil {
+	bufferedOut := newBufferedWriteSeeker(out, 64*1024)
+
+	if err := JoinFileStreams(handles, bufferedOut, progress); err != nil {
+		return err
+	}
+	if err := bufferedOut.Flush(); err != nil {
 		return err
 	}
 	return nil
 }
 
 // JoinFileStreams merges streams into the provided output seeker.
-func JoinFileStreams(files []Stream, output io.ReadWriteSeeker, progress func(float64)) error {
+func JoinFileStreams(files []Stream, output io.WriteSeeker, progress func(float64)) error {
 	if len(files) == 0 {
 		return errors.New("mp4merge: no streams provided")
 	}

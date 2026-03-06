@@ -81,7 +81,7 @@ func readDesc(r io.ReadSeeker, d *desc, track int, maxRead uint64, fileIndex int
 			return err
 		}
 		if size == 0 || typ == 0 {
-			break
+			continue
 		}
 
 		if hasChildren(typ, true) {

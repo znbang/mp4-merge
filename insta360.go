@@ -156,7 +156,7 @@ func getInsta360Offsets(files []*fileHandle) ([][]instaRecord, error) {
 	return result, nil
 }
 
-func mergeInsta360Metadata(files []*fileHandle, offsets [][]instaRecord, out io.ReadWriteSeeker) error {
+func mergeInsta360Metadata(files []*fileHandle, offsets [][]instaRecord, out io.WriteSeeker) error {
 	if len(files) != len(offsets) {
 		return errors.New("mp4merge: mismatched insta360 metadata inputs")
 	}
