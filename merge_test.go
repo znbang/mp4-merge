@@ -546,6 +546,62 @@ func TestJoinFileStreamsWithCreatesOutputAfterValidation(t *testing.T) {
 	}
 }
 
+func TestJoinFileStreamsWithClosesOutputAfterWriteFailure(t *testing.T) {
+	data := buildTestMP4(testFileSpec{trackID: 1, sampleSizes: []uint32{2}, sampleDelta: 1000, keyframes: []uint32{1}})
+	output := &failingOutput{writeErr: io.ErrClosedPipe}
+	returned, err := JoinFileStreamsWith([]Stream{{Reader: bytes.NewReader(data), Size: int64(len(data))}}, func() (io.WriteSeeker, error) {
+		return output, nil
+	}, nil)
+	if err == nil {
+		t.Fatal("expected merge write failure")
+	}
+	if returned != nil {
+		t.Fatalf("returned output = %T, want nil on failure", returned)
+	}
+	if !output.closed {
+		t.Fatal("output closer was not called after merge failure")
+	}
+}
+
+func TestJoinPreservesSDTPFromLaterInput(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, "first.mp4")
+	second := filepath.Join(dir, "second.mp4")
+	output := filepath.Join(dir, "merged.mp4")
+	writeTestMP4(t, first, testFileSpec{
+		trackID:     1,
+		sampleSizes: []uint32{2, 2},
+		sampleDelta: 1000,
+		keyframes:   []uint32{1},
+	})
+	writeTestMP4(t, second, testFileSpec{
+		trackID:     1,
+		sampleSizes: []uint32{2, 2},
+		sampleDelta: 1000,
+		keyframes:   []uint32{1},
+		sdtp:        []byte{0x12, 0x34},
+	})
+	if err := JoinFiles([]string{first, second}, output, nil); err != nil {
+		t.Fatalf("JoinFiles failed: %v", err)
+	}
+
+	d := loadDescFromFile(t, output)
+	if len(d.parts) != 1 {
+		t.Fatalf("merged description has %d parts, want 1", len(d.parts))
+	}
+	if len(d.parts[0].tracks) != 1 {
+		t.Fatalf("merged part has %d tracks, want 1", len(d.parts[0].tracks))
+	}
+	track := d.parts[0].tracks[0]
+	if !track.hasSDTP {
+		t.Fatal("merged track has no sdtp table")
+	}
+	want := []byte{0, 0, 0x12, 0x34}
+	if !bytes.Equal(track.sdtp, want) {
+		t.Fatalf("merged sdtp = %x, want %x", track.sdtp, want)
+	}
+}
+
 func TestReadBoxValidatesSizeAndReturnsPosition(t *testing.T) {
 	data := make([]byte, 16)
 	binary.BigEndian.PutUint32(data[:4], 16)
@@ -944,8 +1000,18 @@ type testFileSpec struct {
 	sampleSizes []uint32
 	sampleDelta uint32
 	keyframes   []uint32
+	sdtp        []byte
 	insta       *instaSpec
 }
+
+type failingOutput struct {
+	closed   bool
+	writeErr error
+}
+
+func (w *failingOutput) Write([]byte) (int, error)      { return 0, w.writeErr }
+func (w *failingOutput) Seek(int64, int) (int64, error) { return 0, nil }
+func (w *failingOutput) Close() error                   { w.closed = true; return nil }
 
 func writeTestMP4(t *testing.T, path string, spec testFileSpec) {
 	t.Helper()
@@ -1020,6 +1086,9 @@ func makeMOOV(spec testFileSpec, duration uint32, sampleCount uint32, chunkOffse
 	stss := makeSTSS(spec.keyframes)
 
 	stblChildren := [][]byte{stsd, stts, stsc, stsz, stco}
+	if len(spec.sdtp) > 0 {
+		stblChildren = append(stblChildren, makeSDTP(spec.sdtp))
+	}
 	if len(spec.keyframes) > 0 {
 		stblChildren = append(stblChildren, stss)
 	}
@@ -1182,6 +1251,11 @@ func makeSTSS(entries []uint32) []byte {
 		_ = binary.Write(buf, binary.BigEndian, e)
 	}
 	return makeBox("stss", buf.Bytes())
+}
+
+func makeSDTP(entries []byte) []byte {
+	body := append([]byte{0, 0, 0, 0}, entries...)
+	return makeBox("sdtp", body)
 }
 
 func makeVMHD() []byte {

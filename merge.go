@@ -472,16 +472,18 @@ func mergeTrack(d *desc, index int, movieScale uint32, starts []uint64, continue
 	if constant {
 		out.stszSampleSize = first.stszSampleSize
 	}
-	anyCTTS, anySTSS, anySTPS := false, false, false
+	anyCTTS, anySTSS, anySTPS, anySDTP := false, false, false, false
 	cttsVersion := uint8(0)
 	for _, x := range tableInputs {
 		anyCTTS = anyCTTS || x.hasCTTS
 		anySTSS = anySTSS || x.hasSTSS
 		anySTPS = anySTPS || x.hasSTPS
+		anySDTP = anySDTP || x.hasSDTP
 		if x.hasCTTS && x.cttsVersion > cttsVersion {
 			cttsVersion = x.cttsVersion
 		}
 	}
+	out.hasSDTP = anySDTP
 	var ctts []cttsEntry
 	var stss, stps []uint32
 	var sampleOff, chunkOff uint32
@@ -580,11 +582,15 @@ func mergeTrack(d *desc, index int, movieScale uint32, starts []uint64, continue
 			out.stsc = append(out.stsc, c)
 		}
 		out.stco = append(out.stco, x.stco...)
-		if first.hasSDTP {
+		if anySDTP {
 			if x.hasSDTP {
-				out.sdtp = append(out.sdtp, x.sdtp...)
+				entries := x.sdtp
+				if uint64(len(entries)) > uint64(x.stszCount) {
+					entries = entries[:x.stszCount]
+				}
+				out.sdtp = append(out.sdtp, entries...)
 			}
-			for len(out.sdtp) < int(sampleOff+x.stszCount) {
+			for uint64(len(out.sdtp)) < uint64(sampleOff)+uint64(x.stszCount) {
 				out.sdtp = append(out.sdtp, 0)
 			}
 		}
@@ -616,7 +622,7 @@ func mergeTrack(d *desc, index int, movieScale uint32, starts []uint64, continue
 					stss = append(stss, sampleOff+1+n)
 				}
 			}
-			if first.hasSDTP {
+			if anySDTP {
 				for n := uint32(0); n < count; n++ {
 					out.sdtp = append(out.sdtp, 0)
 				}
@@ -1981,6 +1987,7 @@ type mergedTrack struct {
 	stps           []uint32
 	hasSTPS        bool
 	sdtp           []byte
+	hasSDTP        bool
 	sampleGroups   []sampleToGroup
 	compactGroups  []compactToGroup
 	stszSampleSize uint32

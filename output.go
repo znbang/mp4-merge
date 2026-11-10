@@ -1,6 +1,7 @@
 package mp4merge
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -57,6 +58,21 @@ func checkedOutputTarget(path string, inputs []*os.File) (string, os.FileMode, b
 		return "", 0, false, fmt.Errorf("mp4merge: output directory %s is not a directory", dir)
 	}
 	return target, mode, direct, nil
+}
+
+func createOutputTemp(dir, base string) (*os.File, error) {
+	for n := 0; n < 1000; n++ {
+		name := filepath.Join(dir, fmt.Sprintf(".%s.%d-%d.mp4merge-partial", base, os.Getpid(), n))
+		file, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o666)
+		if err == nil {
+			return file, nil
+		}
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		return nil, err
+	}
+	return nil, fmt.Errorf("no free temporary output name next to %s", filepath.Join(dir, base))
 }
 
 func resolveOutputLinks(path string) (string, error) {

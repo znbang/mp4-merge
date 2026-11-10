@@ -316,7 +316,7 @@ func JoinFiles(paths []string, outputPath string, progress func(float64)) error 
 	}
 	dir := filepath.Dir(target)
 	base := filepath.Base(target)
-	tmp, err := os.CreateTemp(dir, "."+base+".*.mp4merge-partial")
+	tmp, err := createOutputTemp(dir, base)
 	if err != nil {
 		return fmt.Errorf("mp4merge: create temporary output in %s: %w", dir, err)
 	}
@@ -341,8 +341,6 @@ func JoinFiles(paths []string, outputPath string, progress func(float64)) error 
 			_ = tmp.Close()
 			return fmt.Errorf("mp4merge: preserve output permissions: %w", err)
 		}
-	} else {
-		_ = tmp.Chmod(0644)
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
@@ -405,6 +403,11 @@ func JoinFileStreamsWith(files []Stream, createOutput func() (io.WriteSeeker, er
 		return nil, errors.New("mp4merge: output factory returned nil")
 	}
 	if err := joinPrepared(files, output, d, insta, handles, total, limited); err != nil {
+		if closer, ok := output.(io.Closer); ok {
+			if closeErr := closer.Close(); closeErr != nil {
+				err = errors.Join(err, fmt.Errorf("mp4merge: close output after merge failure: %w", closeErr))
+			}
+		}
 		return nil, err
 	}
 	if progress != nil {

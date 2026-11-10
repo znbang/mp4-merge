@@ -358,7 +358,7 @@ func rewriteBoxes(files []Stream, out io.WriteSeeker, d *desc, track int, maxRea
 		for _, item := range []struct {
 			typ uint32
 			has bool
-		}{{fourCC("ctts"), t.hasCTTS}, {fourCC("stss"), t.hasSTSS}, {fourCC("stps"), t.hasSTPS}} {
+		}{{fourCC("ctts"), t.hasCTTS}, {fourCC("stss"), t.hasSTSS}, {fourCC("stps"), t.hasSTPS}, {fourCC("sdtp"), t.hasSDTP}} {
 			if item.has && !t.written[item.typ] {
 				size, err := writeTable(out, item.typ, t, nil, 0)
 				if err != nil {
