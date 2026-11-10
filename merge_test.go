@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"math"
+	"math/big"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,13 +42,14 @@ func TestJoinAggregatesDurations(t *testing.T) {
 	desc := loadDescFromFile(t, output)
 
 	expectedDuration := uint64(specA.sampleDelta*uint32(len(specA.sampleSizes)) + specB.sampleDelta*uint32(len(specB.sampleSizes)))
-	if desc.moovMvhdDuration != expectedDuration {
-		t.Fatalf("mvhd duration = %d, want %d", desc.moovMvhdDuration, expectedDuration)
+	if desc.movieDuration != expectedDuration {
+		t.Fatalf("mvhd duration = %d, want %d", desc.movieDuration, expectedDuration)
 	}
 
-	var track *trackDesc
-	for _, candidate := range desc.moovTracks {
-		if candidate != nil && candidate.stszCount > 0 {
+	var track *mergedTrack
+	for i := range desc.tracks {
+		candidate := &desc.tracks[i]
+		if candidate.stszCount > 0 {
 			track = candidate
 			break
 		}
@@ -127,6 +130,359 @@ func TestJoinAppendsMetadata(t *testing.T) {
 	}
 }
 
+func TestJoinKeepsDestinationWhenOutputAliasesInput(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "clip.mp4")
+	spec := testFileSpec{trackID: 1, sampleSizes: []uint32{4, 5}, sampleDelta: 1000, keyframes: []uint32{1}}
+	writeTestMP4(t, input, spec)
+	before, err := os.ReadFile(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := JoinFiles([]string{input}, input, nil); err == nil {
+		t.Fatal("expected input/output identity to be refused")
+	}
+	after, err := os.ReadFile(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("input was changed after the merge was refused")
+	}
+}
+
+func TestJoinFailureLeavesExistingDestinationUntouched(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "invalid.mp4")
+	output := filepath.Join(dir, "existing.mp4")
+	if err := os.WriteFile(input, []byte("not an mp4"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	want := []byte("previous complete output")
+	if err := os.WriteFile(output, want, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := JoinFiles([]string{input}, output, nil); err == nil {
+		t.Fatal("expected malformed input to be rejected")
+	}
+	got, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("destination changed: got %q, want %q", got, want)
+	}
+}
+
+func TestJoinWritesDirectlyToDevice(t *testing.T) {
+	device := "/dev/null"
+	if _, err := os.Stat(device); err != nil {
+		t.Skip("/dev/null is unavailable")
+	}
+	dir := t.TempDir()
+	input := filepath.Join(dir, "clip.mp4")
+	writeTestMP4(t, input, testFileSpec{
+		trackID:     1,
+		sampleSizes: []uint32{5},
+		sampleDelta: 1000,
+		keyframes:   []uint32{1},
+	})
+	if err := JoinFiles([]string{input}, device, nil); err != nil {
+		t.Fatalf("JoinFiles to device failed: %v", err)
+	}
+}
+
+func TestJoinSelectsMdatContainingTrackChunks(t *testing.T) {
+	dir := t.TempDir()
+	a, b := filepath.Join(dir, "a.mp4"), filepath.Join(dir, "b.mp4")
+	out := filepath.Join(dir, "merged.mp4")
+	first := testFileSpec{trackID: 1, sampleSizes: []uint32{3, 4}, sampleDelta: 1000, keyframes: []uint32{1}}
+	second := testFileSpec{trackID: 1, sampleSizes: []uint32{2, 5}, sampleDelta: 1000, keyframes: []uint32{1}}
+	if err := os.WriteFile(a, buildTestMP4WithTwoMdats(first), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(b, buildTestMP4WithTwoMdats(second), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := JoinFiles([]string{a, b}, out, nil); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte("unused-mdat")) {
+		t.Fatal("unreferenced mdat payload was copied")
+	}
+	if !bytes.Contains(data, makeSampleData(first.sampleSizes, byte(first.trackID))) || !bytes.Contains(data, makeSampleData(second.sampleSizes, byte(second.trackID))) {
+		t.Fatal("selected mdat payload is missing")
+	}
+}
+
+func TestMergeEditsCutsOverlapAtSeparateRecording(t *testing.T) {
+	track := func(editDuration uint64) *partTrack {
+		return &partTrack{
+			mdhdTimescale: 1000,
+			stts:          [][2]uint32{{1, 1000}},
+			stszCount:     1,
+			hasElst:       true,
+			elst:          []edit{{segmentDuration: editDuration, mediaTime: 0, mediaRate: mediaRateOne}},
+		}
+	}
+	tracks := []*partTrack{track(1200), track(1000)}
+	parts := []partDesc{{mvhdTimescale: 1000}, {mvhdTimescale: 1000}}
+	starts := []uint64{0, 1000}
+	continues := []bool{false}
+
+	edits, whole, duration, fills, lengthens, _, err := mergeEdits(tracks, parts, 1000, 1000, 2000, starts, continues, true, nil)
+	if err != nil {
+		t.Fatalf("mergeEdits failed: %v", err)
+	}
+	if whole {
+		t.Fatal("expected an edit list for the separate recording boundary")
+	}
+	if duration != 2000 {
+		t.Fatalf("timeline duration = %d, want 2000", duration)
+	}
+	if len(fills) != 2 || fills[0] != 0 || fills[1] != 0 {
+		t.Fatalf("PCM fills = %v, want none", fills)
+	}
+	if len(lengthens) != 2 || lengthens[0] != 0 || lengthens[1] != 0 {
+		t.Fatalf("sample lengthenings = %v, want none", lengthens)
+	}
+	if len(edits) != 2 {
+		t.Fatalf("got %d edits, want 2: %#v", len(edits), edits)
+	}
+	if edits[0].segmentDuration != 1000 || edits[0].mediaTime != 0 {
+		t.Fatalf("first edit = %#v, want 1000 ticks at media time 0", edits[0])
+	}
+	if edits[1].segmentDuration != 1000 || edits[1].mediaTime != 1000 {
+		t.Fatalf("second edit = %#v, want 1000 ticks at media time 1000", edits[1])
+	}
+}
+
+func TestMergeTrackCutsSoundAtSampleBoundary(t *testing.T) {
+	makeTrack := func(offset uint64) partTrack {
+		stsd := make([]byte, 8)
+		binary.BigEndian.PutUint32(stsd[4:], 1)
+		return partTrack{
+			handler:       fourCC("soun"),
+			tkhdDuration:  2000,
+			mdhdTimescale: 1000,
+			mdhdDuration:  2000,
+			stsd:          stsd,
+			sampleEntries: []sampleEntry{{format: fourCC("mp4a"), at: 8}},
+			stts:          [][2]uint32{{2, 1000}},
+			stszCount:     2,
+			stsz:          []uint32{1, 1},
+			stsc:          [][3]uint32{{1, 2, 1}},
+			stco:          []uint64{offset},
+		}
+	}
+	first, second := makeTrack(0), makeTrack(2)
+	desc := &desc{parts: []partDesc{
+		{mvhdTimescale: 1000, mvhdDuration: 2000, mdat: [2]uint64{0, 2}, tracks: []partTrack{first}},
+		{mvhdTimescale: 1000, mvhdDuration: 2000, mdat: [2]uint64{2, 2}, tracks: []partTrack{second}},
+	}, movieTimescale: 1000, mdatOffset: 4}
+	merged, _, err := mergeTrack(desc, 0, 1000, []uint64{0, 1500}, []bool{false})
+	if err != nil {
+		t.Fatalf("mergeTrack failed: %v", err)
+	}
+	if merged.stszCount != 3 || merged.mdhdDuration != 3500 {
+		t.Fatalf("merged samples=%d media duration=%d; want 3 samples and 3500 ticks", merged.stszCount, merged.mdhdDuration)
+	}
+	if len(merged.stts) != 2 || merged.stts[0] != [2]uint32{1, 1500} || merged.stts[1] != [2]uint32{2, 1000} {
+		t.Fatalf("merged stts=%v; want first kept sample extended over the gap", merged.stts)
+	}
+	if len(merged.stco) != 2 || len(merged.stsc) != 2 || merged.stsc[0] != [3]uint32{1, 1, 1} || merged.stsc[1] != [3]uint32{2, 2, 1} {
+		t.Fatalf("merged chunks: stco=%v stsc=%v; want one kept first-file sample followed by second-file chunk", merged.stco, merged.stsc)
+	}
+}
+
+func TestRecordingTimeArithmeticMatchesRustWidths(t *testing.T) {
+	if !endsNear(big.NewInt(1), 1000, 3000) {
+		t.Fatal("a 2-second timestamp margin should count as a nearby chapter")
+	}
+	if endsNear(big.NewInt(1), 1000, 3001) {
+		t.Fatal("a timestamp outside the 2-second margin must not count as a nearby chapter")
+	}
+	if endsNear(big.NewInt(0).SetUint64(math.MaxUint64), math.MaxUint32, 0) {
+		t.Fatal("very large creation times must not wrap into the chapter window")
+	}
+	if frameEndIs(math.MaxUint64-1, 2, 0) {
+		t.Fatal("overflowing segment frame ranges must not wrap to frame zero")
+	}
+}
+
+func TestPCMGapsProduceSilenceSamples(t *testing.T) {
+	makeTrack := func() *partTrack {
+		entry := make([]byte, 36)
+		binary.BigEndian.PutUint32(entry[0:4], uint32(len(entry)))
+		binary.BigEndian.PutUint32(entry[4:8], fourCC("sowt"))
+		binary.BigEndian.PutUint16(entry[24:26], 2)
+		binary.BigEndian.PutUint16(entry[26:28], 16)
+		stsd := make([]byte, 8, 8+len(entry))
+		binary.BigEndian.PutUint32(stsd[4:8], 1)
+		stsd = append(stsd, entry...)
+		return &partTrack{
+			handler:        fourCC("soun"),
+			mdhdTimescale:  1000,
+			mdhdDuration:   10,
+			stts:           [][2]uint32{{10, 1}},
+			stszSampleSize: 4,
+			stszCount:      10,
+			stsd:           stsd,
+			sampleEntries:  []sampleEntry{{format: fourCC("sowt"), at: 8}},
+			stsc:           [][3]uint32{{1, 10, 1}},
+			stco:           []uint64{0},
+			hasElst:        true,
+			elst:           []edit{{segmentDuration: 10, mediaTime: 0, mediaRate: mediaRateOne}},
+		}
+	}
+	tracks := []*partTrack{makeTrack(), makeTrack()}
+	tracks[0].sbgp = []sampleToGroup{{groupingType: fourCC("roll"), entries: [][2]uint32{{10, 1}}}}
+	scaled := [][][2]uint32{{{10, 1}}, {{10, 1}}}
+	pcm := pcmTrackFrames(tracks, scaled)
+	if pcm == nil || pcm.frame != 4 || pcm.byte != 0 {
+		t.Fatalf("PCM frame description = %#v, want 4-byte little-endian PCM silence", pcm)
+	}
+	parts := []partDesc{{mvhdTimescale: 1000}, {mvhdTimescale: 1000}}
+	edits, whole, duration, fills, lengthens, _, err := mergeEdits(tracks, parts, 1000, 1000, 20, []uint64{0, 15}, []bool{false}, true, pcm)
+	if err != nil {
+		t.Fatalf("mergeEdits failed: %v", err)
+	}
+	if !whole || duration != 25 || len(edits) != 1 || edits[0].segmentDuration != 25 || fills[0] != 5 {
+		t.Fatalf("edits=%#v whole=%v duration=%d fills=%v; want one 25-tick edit with five silence samples", edits, whole, duration, fills)
+	}
+	if lengthens[0] != 0 || lengthens[1] != 0 {
+		t.Fatalf("PCM silence should not lengthen a source sample: %v", lengthens)
+	}
+	groups, compact, err := mergeSampleGroups(tracks, fills, "PCM test")
+	if err != nil {
+		t.Fatalf("mergeSampleGroups failed: %v", err)
+	}
+	if len(groups) != 1 || len(groups[0].entries) != 2 || groups[0].entries[0] != [2]uint32{10, 1} || groups[0].entries[1] != [2]uint32{15, 0} || len(compact) != 0 {
+		t.Fatalf("sample groups = %v %v; want source group samples plus 15 unmapped samples", groups, compact)
+	}
+
+	second := *tracks[1]
+	second.stco = []uint64{40}
+	parts = []partDesc{
+		{mvhdTimescale: 1000, mvhdDuration: 15, mdat: [2]uint64{0, 40}, tracks: []partTrack{*tracks[0]}},
+		{mvhdTimescale: 1000, mvhdDuration: 15, mdat: [2]uint64{40, 40}, tracks: []partTrack{second}},
+	}
+	desc := &desc{parts: parts, movieTimescale: 1000, mdatOffset: 80}
+	merged, _, err := mergeTrack(desc, 0, 1000, []uint64{0, 15}, []bool{false})
+	if err != nil {
+		t.Fatalf("mergeTrack failed: %v", err)
+	}
+	if merged.stszCount != 25 || merged.stszSampleSize != 4 || merged.mdhdDuration != 25 || len(merged.stts) != 1 || merged.stts[0] != [2]uint32{25, 1} {
+		t.Fatalf("merged PCM tables: sample count=%d size=%d mdhd=%d stts=%v", merged.stszCount, merged.stszSampleSize, merged.mdhdDuration, merged.stts)
+	}
+	if len(merged.stco) != 3 || merged.stco[0] != 0 || merged.stco[1] != 80 || merged.stco[2] != 40 {
+		t.Fatalf("merged PCM chunk offsets = %v, want source, silence, next source", merged.stco)
+	}
+	if len(merged.stsc) != 3 || merged.stsc[0][0] != 1 || merged.stsc[1][0] != 2 || merged.stsc[2][0] != 3 {
+		t.Fatalf("merged PCM chunk map = %v", merged.stsc)
+	}
+	if len(desc.mdatFiller) != 1 || desc.mdatFiller[0] != (fill{length: 20, value: 0}) {
+		t.Fatalf("mdat silence = %v, want 20 zero bytes", desc.mdatFiller)
+	}
+}
+
+func TestGapLengthensLastCodedSample(t *testing.T) {
+	track := func() *partTrack {
+		return &partTrack{
+			handler:       fourCC("soun"),
+			mdhdTimescale: 1000,
+			mdhdDuration:  10,
+			stts:          [][2]uint32{{1, 10}},
+			stszCount:     1,
+		}
+	}
+	tracks := []*partTrack{track(), track()}
+	parts := []partDesc{{mvhdTimescale: 1000}, {mvhdTimescale: 1000}}
+	edits, whole, duration, fills, lengthens, _, err := mergeEdits(tracks, parts, 1000, 1000, 20, []uint64{0, 15}, []bool{false}, true, nil)
+	if err != nil {
+		t.Fatalf("mergeEdits failed: %v", err)
+	}
+	if !whole || duration != 25 || len(edits) != 1 || edits[0].segmentDuration != 25 || fills[0] != 0 || lengthens[0] != 5 {
+		t.Fatalf("edits=%#v whole=%v duration=%d fills=%v lengthens=%v", edits, whole, duration, fills, lengthens)
+	}
+	runs, err := lengthenLastRun([][2]uint32{{1, 10}}, lengthens[0])
+	if err != nil || len(runs) != 1 || runs[0] != [2]uint32{1, 15} {
+		t.Fatalf("lengthened stts = %v, err=%v; want one 15-tick sample", runs, err)
+	}
+}
+
+func TestUnfilledOneTickSoundLeavesGapOut(t *testing.T) {
+	track := func() *partTrack {
+		return &partTrack{
+			handler:        fourCC("soun"),
+			mdhdTimescale:  1000,
+			mdhdDuration:   10,
+			stts:           [][2]uint32{{10, 1}},
+			stszCount:      10,
+			stszSampleSize: 2,
+		}
+	}
+	tracks := []*partTrack{track(), track()}
+	parts := []partDesc{{mvhdTimescale: 1000}, {mvhdTimescale: 1000}}
+	edits, whole, duration, fills, lengthens, _, err := mergeEdits(tracks, parts, 1000, 1000, 20, []uint64{0, 15}, []bool{false}, true, nil)
+	if err != nil {
+		t.Fatalf("mergeEdits failed: %v", err)
+	}
+	if !whole || duration != 20 || len(edits) != 1 || edits[0].segmentDuration != 20 || fills[0] != 0 || lengthens[0] != 0 {
+		t.Fatalf("unfilled one-tick sound should leave the gap out: edits=%#v whole=%v duration=%d fills=%v lengthens=%v", edits, whole, duration, fills, lengthens)
+	}
+}
+
+func TestJoinMatchesRustWithMultipleMdats(t *testing.T) {
+	if os.Getenv("MP4MERGE_RUN_PARITY") == "" {
+		t.Skip("set MP4MERGE_RUN_PARITY=1 to enable parity tests")
+	}
+	if _, err := exec.LookPath("cargo"); err != nil {
+		t.Skip("cargo not available, skipping parity test")
+	}
+	rustDir := os.Getenv("MP4MERGE_RUST_DIR")
+	if rustDir == "" {
+		t.Skip("set MP4MERGE_RUST_DIR to the Rust mp4-merge checkout to enable parity tests")
+	}
+	dir := t.TempDir()
+	a, b := filepath.Join(dir, "a.mp4"), filepath.Join(dir, "b.mp4")
+	outGo, outRust := filepath.Join(dir, "go.mp4"), filepath.Join(dir, "rust.mp4")
+	s1 := testFileSpec{trackID: 1, sampleSizes: []uint32{3, 4}, sampleDelta: 1000, keyframes: []uint32{1}}
+	s2 := testFileSpec{trackID: 1, sampleSizes: []uint32{2, 5}, sampleDelta: 1000, keyframes: []uint32{1}}
+	if err := os.WriteFile(a, buildTestMP4WithTwoMdats(s1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(b, buildTestMP4WithTwoMdats(s2), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := JoinFiles([]string{a, b}, outGo, nil); err != nil {
+		t.Fatal(err)
+	}
+	cargo := exec.Command("cargo", "run", "--quiet", "--", "--out", outRust, a, b)
+	cargo.Dir = rustDir
+	var stdout, stderr bytes.Buffer
+	cargo.Stdout = &stdout
+	cargo.Stderr = &stderr
+	if err := cargo.Run(); err != nil {
+		t.Fatalf("cargo run failed: %v\nstdout: %s\nstderr: %s", err, stdout.String(), stderr.String())
+	}
+	goBytes, err := os.ReadFile(outGo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rustBytes, err := os.ReadFile(outRust)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(goBytes, rustBytes) {
+		t.Fatalf("multi-mdat parity mismatch: go=%d bytes rust=%d bytes", len(goBytes), len(rustBytes))
+	}
+}
+
 func TestJoinValidationErrors(t *testing.T) {
 	if err := JoinFiles(nil, "noop", nil); err == nil {
 		t.Fatalf("expected error when no input files are provided")
@@ -148,6 +504,63 @@ func TestJoinValidationErrors(t *testing.T) {
 
 	if err := JoinFileStreams([]Stream{{Reader: nil, Size: 123}}, tmp, nil); err == nil {
 		t.Fatalf("expected error when stream has nil reader")
+	}
+}
+
+func TestJoinFileStreamsWithCreatesOutputAfterValidation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "merged.mp4")
+	data := buildTestMP4(testFileSpec{trackID: 1, sampleSizes: []uint32{2}, sampleDelta: 1000, keyframes: []uint32{1}})
+	created := false
+	output, err := JoinFileStreamsWith([]Stream{{Reader: bytes.NewReader(data), Size: int64(len(data))}}, func() (io.WriteSeeker, error) {
+		created = true
+		return os.Create(path)
+	}, nil)
+	if err != nil {
+		t.Fatalf("JoinFileStreamsWith failed: %v", err)
+	}
+	if !created {
+		t.Fatal("output factory was not called")
+	}
+	file, ok := output.(*os.File)
+	if !ok {
+		t.Fatalf("returned writer type = %T, want *os.File", output)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close returned output: %v", err)
+	}
+	if info, err := os.Stat(path); err != nil || info.Size() == 0 {
+		t.Fatalf("merged output missing or empty: info=%v err=%v", info, err)
+	}
+
+	invalidCalled := false
+	_, err = JoinFileStreamsWith([]Stream{{Reader: bytes.NewReader(make([]byte, 40)), Size: 40}}, func() (io.WriteSeeker, error) {
+		invalidCalled = true
+		return nil, nil
+	}, nil)
+	if err == nil {
+		t.Fatal("expected invalid input to be rejected")
+	}
+	if invalidCalled {
+		t.Fatal("output factory was called before input validation completed")
+	}
+}
+
+func TestReadBoxValidatesSizeAndReturnsPosition(t *testing.T) {
+	data := make([]byte, 16)
+	binary.BigEndian.PutUint32(data[:4], 16)
+	binary.BigEndian.PutUint32(data[4:8], fourCC("free"))
+	reader := bytes.NewReader(data)
+	typ, offset, size, header, err := ReadBox(reader)
+	if err != nil {
+		t.Fatalf("ReadBox failed: %v", err)
+	}
+	if typ != fourCC("free") || offset != 0 || size != 16 || header != 8 {
+		t.Fatalf("ReadBox = (%q, %d, %d, %d), want (free, 0, 16, 8)", typeToString(typ), offset, size, header)
+	}
+	binary.BigEndian.PutUint32(data[:4], 4)
+	if _, _, _, _, err := ReadBox(bytes.NewReader(data)); err == nil {
+		t.Fatal("expected a box smaller than its header to be rejected")
 	}
 }
 
@@ -199,6 +612,226 @@ func TestJoinMatchesRustWithInsta(t *testing.T) {
 	})
 }
 
+func TestJoinMatchesRustWithPCMSilenceGap(t *testing.T) {
+	if os.Getenv("MP4MERGE_RUN_PARITY") == "" {
+		t.Skip("set MP4MERGE_RUN_PARITY=1 to enable parity tests")
+	}
+	if _, err := exec.LookPath("cargo"); err != nil {
+		t.Skip("cargo not available, skipping parity test")
+	}
+	rustDir := os.Getenv("MP4MERGE_RUST_DIR")
+	if rustDir == "" {
+		t.Skip("set MP4MERGE_RUST_DIR to the Rust mp4-merge checkout to enable parity tests")
+	}
+	dir := t.TempDir()
+	inputs := []string{filepath.Join(dir, "clip1.mp4"), filepath.Join(dir, "clip2.mp4")}
+	outputGo, outputRust := filepath.Join(dir, "merged-go.mp4"), filepath.Join(dir, "merged-rust.mp4")
+	writeTestPCMGapMP4(t, inputs[0], []uint32{3, 3, 3}, 5, 10, 1, 100)
+	writeTestPCMGapMP4(t, inputs[1], []uint32{3, 3}, 5, 10, 1, 200)
+	if err := JoinFiles(inputs, outputGo, nil); err != nil {
+		t.Fatalf("Go JoinFiles failed: %v", err)
+	}
+	cargo := exec.Command("cargo", "run", "--quiet", "--", "--out", outputRust, inputs[0], inputs[1])
+	cargo.Dir = rustDir
+	var stdout, stderr bytes.Buffer
+	cargo.Stdout, cargo.Stderr = &stdout, &stderr
+	if err := cargo.Run(); err != nil {
+		t.Fatalf("cargo run failed: %v\nstdout: %s\nstderr: %s", err, stdout.String(), stderr.String())
+	}
+	goBytes, err := os.ReadFile(outputGo)
+	if err != nil {
+		t.Fatalf("read Go output: %v", err)
+	}
+	rustBytes, err := os.ReadFile(outputRust)
+	if err != nil {
+		t.Fatalf("read Rust output: %v", err)
+	}
+	if !bytes.Equal(goBytes, rustBytes) {
+		at := 0
+		for at < len(goBytes) && at < len(rustBytes) && goBytes[at] == rustBytes[at] {
+			at++
+		}
+		t.Fatalf("PCM gap parity mismatch: Go len=%d Rust len=%d first diff=%d", len(goBytes), len(rustBytes), at)
+	}
+}
+
+func TestJoinMatchesRustWithSoundOverlap(t *testing.T) {
+	if os.Getenv("MP4MERGE_RUN_PARITY") == "" {
+		t.Skip("set MP4MERGE_RUN_PARITY=1 to enable parity tests")
+	}
+	if _, err := exec.LookPath("cargo"); err != nil {
+		t.Skip("cargo not available, skipping parity test")
+	}
+	rustDir := os.Getenv("MP4MERGE_RUST_DIR")
+	if rustDir == "" {
+		t.Skip("set MP4MERGE_RUST_DIR to the Rust mp4-merge checkout to enable parity tests")
+	}
+	dir := t.TempDir()
+	inputs := []string{filepath.Join(dir, "clip1.mp4"), filepath.Join(dir, "clip2.mp4")}
+	outputGo, outputRust := filepath.Join(dir, "merged-go.mp4"), filepath.Join(dir, "merged-rust.mp4")
+	writeTestSoundOverlapMP4(t, inputs[0], 100, true)
+	writeTestSoundOverlapMP4(t, inputs[1], 200, false)
+	if err := JoinFiles(inputs, outputGo, nil); err != nil {
+		t.Fatalf("Go JoinFiles failed: %v", err)
+	}
+	cargo := exec.Command("cargo", "run", "--quiet", "--", "--out", outputRust, inputs[0], inputs[1])
+	cargo.Dir = rustDir
+	var stdout, stderr bytes.Buffer
+	cargo.Stdout, cargo.Stderr = &stdout, &stderr
+	if err := cargo.Run(); err != nil {
+		t.Fatalf("cargo run failed: %v\nstdout: %s\nstderr: %s", err, stdout.String(), stderr.String())
+	}
+	goBytes, err := os.ReadFile(outputGo)
+	if err != nil {
+		t.Fatalf("read Go output: %v", err)
+	}
+	rustBytes, err := os.ReadFile(outputRust)
+	if err != nil {
+		t.Fatalf("read Rust output: %v", err)
+	}
+	if !bytes.Equal(goBytes, rustBytes) {
+		at := 0
+		for at < len(goBytes) && at < len(rustBytes) && goBytes[at] == rustBytes[at] {
+			at++
+		}
+		lo, goHi, rustHi := at-16, at+32, at+32
+		if lo < 0 {
+			lo = 0
+		}
+		if goHi > len(goBytes) {
+			goHi = len(goBytes)
+		}
+		if rustHi > len(rustBytes) {
+			rustHi = len(rustBytes)
+		}
+		t.Fatalf("sound overlap parity mismatch: Go len=%d Rust len=%d first diff=%d\nGo:   %x\nRust: %x", len(goBytes), len(rustBytes), at, goBytes[lo:goHi], rustBytes[lo:rustHi])
+	}
+}
+
+func writeTestPCMGapMP4(t *testing.T, path string, videoSizes []uint32, videoDelta, audioSamples, audioDelta, creation uint32) {
+	t.Helper()
+	ftyp := makeFTYP()
+	videoData := makeSampleData(videoSizes, 0x30)
+	audioData := bytes.Repeat([]byte{0x40}, int(audioSamples*4))
+	mdatPayload := append(append([]byte(nil), videoData...), audioData...)
+	mdat := makeMDAT(mdatPayload)
+	dataOffset := len(ftyp) + 8
+	videoDuration := uint32(len(videoSizes)) * videoDelta
+	audioDuration := audioSamples * audioDelta
+	videoTrack := makeTestTrackBox(1, "vide", videoDuration, uint32(len(videoSizes)), videoDelta, videoSizes, 0, uint32(dataOffset), makeSTSD(1920, 1080), makeVMHD())
+	audioSizes := make([]uint32, audioSamples)
+	for i := range audioSizes {
+		audioSizes[i] = 4
+	}
+	audioTrack := makeTestTrackBox(2, "soun", audioDuration, audioSamples, audioDelta, audioSizes, 4, uint32(dataOffset+len(videoData)), makePCMSTSD(), makeSMHD())
+	duration := videoDuration
+	if audioDuration > duration {
+		duration = audioDuration
+	}
+	mvhd := makeMVHD(1000, duration, 3)
+	binary.BigEndian.PutUint32(mvhd[12:16], creation)
+	moov := makeContainer("moov", mvhd, videoTrack, audioTrack)
+	data := append(append(append([]byte(nil), ftyp...), mdat...), moov...)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func writeTestSoundOverlapMP4(t *testing.T, path string, creation uint32, leadingEmpty bool) {
+	t.Helper()
+	ftyp := makeFTYP()
+	videoSizes := []uint32{2, 2}
+	audioSizes := []uint32{2, 2, 2}
+	videoData := makeSampleData(videoSizes, 0x30)
+	audioData := makeSampleData(audioSizes, 0x40)
+	mdat := makeMDAT(append(videoData, audioData...))
+	dataOffset := uint32(len(ftyp) + 8)
+	videoTrack := makeTestTrackBox(1, "vide", 2000, 2, 1000, videoSizes, 0, dataOffset, makeSTSD(1920, 1080), makeVMHD())
+	var audioEdits []edit
+	if leadingEmpty {
+		audioEdits = []edit{{segmentDuration: 1000, mediaTime: -1, mediaRate: mediaRateOne}, {segmentDuration: 3000, mediaTime: 0, mediaRate: mediaRateOne}}
+	}
+	audioTrack := makeTestTrackBox(2, "soun", 3000, 3, 1000, audioSizes, 0, dataOffset+uint32(len(videoData)), makeAudioTestSTSD(), makeSMHD(), audioEdits...)
+	mvhd := makeMVHD(1000, 3000, 3)
+	binary.BigEndian.PutUint32(mvhd[12:16], creation)
+	moov := makeContainer("moov", mvhd, videoTrack, audioTrack)
+	data := append(append(append([]byte(nil), ftyp...), mdat...), moov...)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func makeAudioTestSTSD() []byte {
+	body := &bytes.Buffer{}
+	body.Write([]byte{0, 0, 0, 0})
+	_ = binary.Write(body, binary.BigEndian, uint32(1))
+	entry := make([]byte, 36)
+	binary.BigEndian.PutUint32(entry[:4], uint32(len(entry)))
+	binary.BigEndian.PutUint32(entry[4:8], fourCC("mp4a"))
+	binary.BigEndian.PutUint16(entry[14:16], 1)
+	binary.BigEndian.PutUint16(entry[24:26], 2)
+	binary.BigEndian.PutUint16(entry[26:28], 16)
+	binary.BigEndian.PutUint32(entry[32:36], 48000<<16)
+	body.Write(entry)
+	return makeBox("stsd", body.Bytes())
+}
+
+func makeTestTrackBox(trackID uint32, handler string, duration, sampleCount, delta uint32, sampleSizes []uint32, fixedSampleSize, chunkOffset uint32, stsd, mediaHeader []byte, editList ...edit) []byte {
+	tkhd := makeTKHD(trackID, duration, 1920, 1080)
+	mdhd := makeMDHD(1000, duration)
+	stblChildren := [][]byte{stsd, makeSTTS(sampleCount, delta), makeSTSC(1, sampleCount, 1)}
+	if fixedSampleSize != 0 {
+		stblChildren = append(stblChildren, makeSTSZFixed(fixedSampleSize, sampleCount))
+	} else {
+		stblChildren = append(stblChildren, makeSTSZ(sampleSizes))
+	}
+	stblChildren = append(stblChildren, makeSTCO(chunkOffset))
+	stbl := makeContainer("stbl", stblChildren...)
+	minf := makeContainer("minf", mediaHeader, makeDINF(), stbl)
+	mdia := makeContainer("mdia", mdhd, makeHDLR(handler), minf)
+	elst := makeELST(duration)
+	if len(editList) > 0 {
+		body := &bytes.Buffer{}
+		body.Write([]byte{0, 0, 0, 0})
+		_ = binary.Write(body, binary.BigEndian, uint32(len(editList)))
+		for _, edit := range editList {
+			_ = binary.Write(body, binary.BigEndian, uint32(edit.segmentDuration))
+			_ = binary.Write(body, binary.BigEndian, int32(edit.mediaTime))
+			_ = binary.Write(body, binary.BigEndian, uint16(uint32(edit.mediaRate)>>16))
+			_ = binary.Write(body, binary.BigEndian, uint16(edit.mediaRate))
+		}
+		elst = makeBox("elst", body.Bytes())
+	}
+	return makeContainer("trak", tkhd, makeContainer("edts", elst), mdia)
+}
+
+func makePCMSTSD() []byte {
+	body := &bytes.Buffer{}
+	body.Write([]byte{0, 0, 0, 0})
+	_ = binary.Write(body, binary.BigEndian, uint32(1))
+	entry := make([]byte, 36)
+	binary.BigEndian.PutUint32(entry[:4], uint32(len(entry)))
+	binary.BigEndian.PutUint32(entry[4:8], fourCC("sowt"))
+	binary.BigEndian.PutUint16(entry[14:16], 1)
+	binary.BigEndian.PutUint16(entry[24:26], 2)
+	binary.BigEndian.PutUint16(entry[26:28], 16)
+	binary.BigEndian.PutUint32(entry[32:36], 1000<<16)
+	body.Write(entry)
+	return makeBox("stsd", body.Bytes())
+}
+
+func makeSTSZFixed(size, count uint32) []byte {
+	body := &bytes.Buffer{}
+	body.Write([]byte{0, 0, 0, 0})
+	_ = binary.Write(body, binary.BigEndian, size)
+	_ = binary.Write(body, binary.BigEndian, count)
+	return makeBox("stsz", body.Bytes())
+}
+
+func makeSMHD() []byte {
+	return makeBox("smhd", []byte{0, 0, 0, 0, 0, 0, 0, 0})
+}
+
 func runParityTest(t *testing.T, spec1, spec2 testFileSpec) {
 	t.Helper()
 	if _, err := exec.LookPath("cargo"); err != nil {
@@ -219,9 +852,12 @@ func runParityTest(t *testing.T, spec1, spec2 testFileSpec) {
 		t.Fatalf("JoinFiles failed: %v", err)
 	}
 
-	repoRoot, err := filepath.Abs("..")
-	if err != nil {
-		t.Fatalf("locate repo root: %v", err)
+	repoRoot := os.Getenv("MP4MERGE_RUST_DIR")
+	if repoRoot == "" {
+		t.Skip("set MP4MERGE_RUST_DIR to the Rust mp4-merge checkout to enable parity tests")
+	}
+	if _, err := os.Stat(filepath.Join(repoRoot, "Cargo.toml")); err != nil {
+		t.Fatalf("MP4MERGE_RUST_DIR %q is not a Rust checkout: %v", repoRoot, err)
 	}
 
 	cargo := exec.Command("cargo", "run", "--quiet", "--", "--out", outputRust, input1, input2)
@@ -243,7 +879,21 @@ func runParityTest(t *testing.T, spec1, spec2 testFileSpec) {
 	}
 
 	if !bytes.Equal(goBytes, rustBytes) {
-		t.Fatalf("merged output mismatch: go len=%d rust len=%d", len(goBytes), len(rustBytes))
+		at := 0
+		for at < len(goBytes) && at < len(rustBytes) && goBytes[at] == rustBytes[at] {
+			at++
+		}
+		lo, hi := at-16, at+32
+		if lo < 0 {
+			lo = 0
+		}
+		if hi > len(goBytes) {
+			hi = len(goBytes)
+		}
+		if hi > len(rustBytes) {
+			hi = len(rustBytes)
+		}
+		t.Fatalf("merged output mismatch: go len=%d rust len=%d first diff=%d go=%x rust=%x", len(goBytes), len(rustBytes), at, goBytes[lo:hi], rustBytes[lo:hi])
 	}
 }
 
@@ -255,43 +905,13 @@ func loadDescFromFile(t *testing.T, path string) *desc {
 	}
 	defer f.Close()
 
-	d := newDesc()
-
-	for {
-		typ, _, size, headerSize, err := readBox(f)
-		if err != nil {
-			t.Fatalf("locate mdat: %v", err)
-		}
-		pos, err := f.Seek(0, io.SeekCurrent)
-		if err != nil {
-			t.Fatalf("record offset: %v", err)
-		}
-		if typ == fourCC("mdat") {
-			dataSize := size
-			if dataSize >= uint64(headerSize) {
-				dataSize -= uint64(headerSize)
-			} else {
-				dataSize = 0
-			}
-			d.mdatPosition = append(d.mdatPosition, mdatPosition{
-				fileIndex: -1,
-				offset:    uint64(pos),
-				size:      dataSize,
-			})
-			d.mdatFinalPosition = uint64(pos)
-			break
-		}
-		if _, err := f.Seek(int64(pos)+int64(size)-headerSize, io.SeekStart); err != nil {
-			t.Fatalf("skip box: %v", err)
-		}
+	info, err := f.Stat()
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
 	}
-
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		t.Fatalf("rewind file: %v", err)
-	}
-
-	if err := readDesc(f, d, 0, ^uint64(0), 0); err != nil {
-		t.Fatalf("read final desc: %v", err)
+	d, _, _, _, err := prepareInputs([]Stream{{Reader: f, Size: info.Size()}}, nil)
+	if err != nil {
+		t.Fatalf("read merged description: %v", err)
 	}
 	return d
 }
@@ -353,6 +973,24 @@ func buildTestMP4(spec testFileSpec) []byte {
 		file = append(file, makeInstaMetadata(spec.insta)...)
 	}
 	return file
+}
+
+func buildTestMP4WithTwoMdats(spec testFileSpec) []byte {
+	ftyp := makeFTYP()
+	unused := makeMDAT([]byte("unused-mdat"))
+	sampleData := makeSampleData(spec.sampleSizes, byte(spec.trackID))
+	mdat := makeMDAT(sampleData)
+	duration := spec.sampleDelta * uint32(len(spec.sampleSizes))
+	offset := len(ftyp) + len(unused) + 8
+	moov := makeMOOV(spec, duration, uint32(len(spec.sampleSizes)), offset)
+	data := append([]byte{}, ftyp...)
+	data = append(data, unused...)
+	data = append(data, mdat...)
+	data = append(data, moov...)
+	if spec.insta != nil {
+		data = append(data, makeInstaMetadata(spec.insta)...)
+	}
+	return data
 }
 
 func makeFTYP() []byte {

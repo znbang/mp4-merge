@@ -13,6 +13,8 @@ The API mirrors the original Rust implementation:
 	}
 
 When finer control is required, JoinFileStreams accepts already opened
-read/seek handles and writes into any io.ReadWriteSeeker destination.
+read/seek handles and writes into an io.WriteSeeker destination. Use
+JoinFileStreamsWith to create that destination only after all input files have
+been validated. ReadBox exposes the ISO BMFF header reader used by the merger.
 */
 package mp4merge

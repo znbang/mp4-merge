@@ -13,9 +13,12 @@ with a Go toolchain.
 ## Features
 
 - Merges camera-split files without re-encoding or quality loss.
-- Preserves all original tracks (video, audio, metadata).
-- Maintains timing tables, offsets, and Insta360 extensions.
-- CLI flag set mirrors the Rust binary for drop-in adoption.
+- Preserves video, audio, metadata, edit lists, sample dependency tables, and sample groups.
+- Chooses an exact merged media timescale and aligns tracks across recording boundaries.
+- Cuts overlapping sound at sample boundaries and fills supported PCM gaps with silence.
+- Merges AVC/HEVC parameter sets, Insta360 trailers, and camera segment-table timing.
+- Validates box and chunk-table bounds before writing; file output is published atomically.
+- Mirrors the Rust CLI flags and exposes stream APIs, including deferred output creation.
 
 ## Installation
 
@@ -64,8 +67,9 @@ func main() {
 }
 ```
 
-`JoinFileStreams` is also available when you already have opened `io.ReadSeeker`
-handles.
+`JoinFileStreams` is available when you already have opened `io.ReadSeeker`
+handles. `JoinFileStreamsWith` accepts an output factory and calls it only after
+all inputs pass validation.
 
 ## How it works
 
@@ -74,9 +78,11 @@ The implementation follows the same approach as the Rust project:
 1. Scan every input file and collect:
    - `mdat` offsets and sizes
    - Durations from `mvhd`, `tkhd`, `mdhd`
-   - `stbl` descriptors (`stts`, `stsz`, `stss`, `stsc`, `stco`/`co64`)
+   - Edit lists and sample-table descriptors (`stts`, `ctts`, `stsz`, `stss`, `stps`, `sdtp`, `sbgp`, `csgm`, `stsc`, `stco`/`co64`)
 2. Merge the collected metadata: sum durations, append sample tables, and adjust
-   chunk offsets based on accumulated `mdat` sizes.
+   chunk offsets based on accumulated `mdat` sizes. Keep sample timing exact,
+   align separate recordings to the anchor video track, and handle supported
+   audio overlaps and gaps.
 3. Walk the first file’s boxes, writing them to the output while:
    - Rebuilding `mdat` as a 64-bit box and copying payloads from all inputs.
    - Patching durations in `mvhd`, `tkhd`, `mdhd`.
