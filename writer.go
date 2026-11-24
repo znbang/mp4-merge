@@ -68,9 +68,7 @@ func rewriteBoxes(files []Stream, out io.WriteSeeker, d *desc, track int, maxRea
 		pos := uint64(start) + total
 		remaining := end - pos
 		if remaining < 8 {
-			if parent != 0 && remaining != 0 {
-				return written, mp4Error("invalid data", "%s ends with %d bytes that are not a box", typeToString(parent), remaining)
-			}
+			// QuickTime's 32-bit 0 that ends a list of atoms, already validated by readDescription.
 			if _, err := first.Seek(int64(end), io.SeekStart); err != nil {
 				return written, err
 			}
@@ -223,12 +221,12 @@ func rewriteBoxes(files []Stream, out io.WriteSeeker, d *desc, track int, maxRea
 				return written, err
 			}
 			newSize = 0
-		case typ == fourCC("mvhd") || typ == fourCC("tkhd") || typ == fourCC("mdhd"):
+		case (typ == fourCC("mvhd") && parent == fourCC("moov")) || (typ == fourCC("tkhd") && parent == fourCC("trak")) || (typ == fourCC("mdhd") && parent == fourCC("mdia")):
 			body, err := readBody(first, size-h.headerSize, typ, h.offset)
 			if err != nil {
 				return written, err
 			}
-			if typ == fourCC("mvhd") && parent == fourCC("moov") {
+			if typ == fourCC("mvhd") {
 				err = setDuration(&body, typ, d.movieDuration)
 			}
 			if track < len(d.tracks) {
@@ -256,8 +254,8 @@ func rewriteBoxes(files []Stream, out io.WriteSeeker, d *desc, track int, maxRea
 			if err != nil {
 				return written, err
 			}
-			if typ == fourCC("tkhd") && track < len(d.tracks) && d.tracks[track].insertEdts && !d.parts[0].tracks[track].hasEdts {
-				body, err := elstBody(d.tracks[track].elst)
+			if typ == fourCC("tkhd") && track < len(d.tracks) && d.tracks[track].insertEdts && d.tracks[track].hasElst && !d.parts[0].tracks[track].hasEdts {
+				body, err := elstBody(0, 0, d.tracks[track].elst)
 				if err != nil {
 					return written, err
 				}
@@ -268,17 +266,32 @@ func rewriteBoxes(files []Stream, out io.WriteSeeker, d *desc, track int, maxRea
 				}
 				newSize += uint64(len(edts))
 			}
-		case typ == fourCC("elst") && (parent == fourCC("edts") || parent == fourCC("trak")) && track < len(d.tracks) && (d.parts[0].tracks[track].hasElst || d.tracks[track].insertEdts):
-			if _, err := first.Seek(int64(h.end), io.SeekStart); err != nil {
-				return written, err
-			}
-			body, err := elstBody(d.tracks[track].elst)
-			if err != nil {
-				return written, err
-			}
-			newSize, err = writeBox(out, typ, h.headerSize, body)
-			if err != nil {
-				return written, err
+		case typ == fourCC("elst") && (parent == fourCC("edts") || parent == fourCC("trak")):
+			if track < len(d.tracks) && d.tracks[track].hasElst {
+				var vf [4]byte
+				if _, err := io.ReadFull(first, vf[:]); err != nil {
+					return written, inFile(0, err)
+				}
+				origVersion := vf[0]
+				origFlags := uint32(vf[1])<<16 | uint32(vf[2])<<8 | uint32(vf[3])
+				if _, err := first.Seek(int64(h.end), io.SeekStart); err != nil {
+					return written, err
+				}
+				body, err := elstBody(origVersion, origFlags, d.tracks[track].elst)
+				if err != nil {
+					return written, err
+				}
+				newSize, err = writeBox(out, typ, h.headerSize, body)
+				if err != nil {
+					return written, err
+				}
+			} else {
+				if _, err := first.Seek(int64(h.offset), io.SeekStart); err != nil {
+					return written, err
+				}
+				if err := copyExact(out, first, size); err != nil {
+					return written, inFile(0, err)
+				}
 			}
 		case typ == fourCC("stsd") && parent == fourCC("stbl") && track < len(d.tracks) && d.tracks[track].hasSTSD:
 			if _, err := first.Seek(int64(h.end), io.SeekStart); err != nil {
@@ -342,8 +355,8 @@ func rewriteBoxes(files []Stream, out io.WriteSeeker, d *desc, track int, maxRea
 			return written, err
 		}
 	}
-	if parent == fourCC("edts") && track < len(d.tracks) && d.tracks[track].insertEdts {
-		body, err := elstBody(d.tracks[track].elst)
+	if parent == fourCC("edts") && track < len(d.tracks) && d.tracks[track].insertEdts && d.tracks[track].hasElst {
+		body, err := elstBody(0, 0, d.tracks[track].elst)
 		if err != nil {
 			return written, err
 		}
@@ -623,15 +636,18 @@ func setDuration(body *[]byte, typ uint32, duration uint64) error {
 	*body = v
 	return nil
 }
-func elstBody(edits []edit) ([]byte, error) {
+func elstBody(version uint8, flags uint32, edits []edit) ([]byte, error) {
 	v := uint8(0)
+	if version == 1 {
+		v = 1
+	}
 	for _, e := range edits {
 		if e.segmentDuration > math.MaxUint32 || e.mediaTime < math.MinInt32 || e.mediaTime > math.MaxInt32 {
 			v = 1
 		}
 	}
 	b := make([]byte, 4)
-	b[0] = v
+	binary.BigEndian.PutUint32(b, uint32(v)<<24|(flags&0x00ffffff))
 	b = binary.BigEndian.AppendUint32(b, uint32(len(edits)))
 	for _, e := range edits {
 		if v == 1 {

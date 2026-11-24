@@ -275,7 +275,7 @@ func JoinFiles(paths []string, outputPath string, progress func(float64)) error 
 		inputs = append(inputs, f)
 		streams = append(streams, Stream{Reader: f, Size: st.Size()})
 	}
-	target, mode, direct, err := checkedOutputTarget(outputPath, inputs)
+	target, mode, direct, err := checkedOutputTarget(outputPath, paths, inputs)
 	if err != nil {
 		return err
 	}
@@ -383,15 +383,7 @@ func JoinFileStreamsWith(files []Stream, createOutput func() (io.WriteSeeker, er
 	if createOutput == nil {
 		return nil, errors.New("mp4merge: nil output factory")
 	}
-	limited := func(p float64) {
-		if progress != nil {
-			if p >= 1 {
-				p = 0.9999
-			}
-			progress(p)
-		}
-	}
-	d, insta, handles, total, err := prepareInputs(files, limited)
+	d, insta, handles, total, err := prepareInputs(files, progress)
 	if err != nil {
 		return nil, err
 	}
@@ -402,16 +394,13 @@ func JoinFileStreamsWith(files []Stream, createOutput func() (io.WriteSeeker, er
 	if output == nil {
 		return nil, errors.New("mp4merge: output factory returned nil")
 	}
-	if err := joinPrepared(files, output, d, insta, handles, total, limited); err != nil {
+	if err := joinPrepared(files, output, d, insta, handles, total, progress); err != nil {
 		if closer, ok := output.(io.Closer); ok {
 			if closeErr := closer.Close(); closeErr != nil {
 				err = errors.Join(err, fmt.Errorf("mp4merge: close output after merge failure: %w", closeErr))
 			}
 		}
 		return nil, err
-	}
-	if progress != nil {
-		progress(1)
 	}
 	return output, nil
 }
@@ -464,26 +453,6 @@ func prepareInputs(files []Stream, progress func(float64)) (*desc, bool, []*file
 			return nil, false, nil, 0, mp4Error("unsupported input", "file %d %s Insta360 metadata, but file 1 %s", i+1, map[bool]string{true: "has", false: "has no"}[hasInsta], map[bool]string{true: "has it", false: "doesn't"}[*insta])
 		}
 		p := partDesc{end: boxesEnd, size: uint64(f.Size)}
-		if _, err := f.Reader.Seek(0, io.SeekStart); err != nil {
-			return nil, false, nil, 0, err
-		}
-		for pos := uint64(0); pos < boxesEnd; {
-			if boxesEnd-pos < 8 {
-				break
-			}
-			h, err := readBoxWithin(f.Reader, boxesEnd, boxesEnd)
-			if err != nil {
-				return nil, false, nil, 0, inFile(i, err)
-			}
-			if h.size == 0 {
-				pos = h.end
-				break
-			}
-			pos = h.end
-			if _, err := f.Reader.Seek(int64(pos), io.SeekStart); err != nil {
-				return nil, false, nil, 0, err
-			}
-		}
 		d.parts = append(d.parts, p)
 		part := &d.parts[i]
 		if _, err := f.Reader.Seek(0, io.SeekStart); err != nil {
@@ -566,13 +535,13 @@ func prepareInputs(files []Stream, progress func(float64)) (*desc, bool, []*file
 }
 
 func joinPrepared(files []Stream, out io.WriteSeeker, d *desc, insta bool, handles []*fileHandle, total int64, progress func(float64)) error {
-	var last time.Time
+	last := time.Now()
 	ps := newProgressStream(out, func(n int64) {
 		if progress == nil || total <= 0 {
 			return
 		}
 		now := time.Now()
-		if !last.IsZero() && now.Sub(last) < 100*time.Millisecond {
+		if now.Sub(last) <= 100*time.Millisecond {
 			return
 		}
 		ratio := float64(n) / float64(total)

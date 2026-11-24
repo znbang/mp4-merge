@@ -34,3 +34,19 @@ func replaceOutputFile(temp, target string) error { return os.Rename(temp, targe
 func isOutputDevice(string) bool { return false }
 
 func checkOutputCanBeReplaced(string) error { return nil }
+
+func sameFileHandle(a, b *os.File) (bool, bool, error) {
+	ai, err := a.Stat()
+	if err != nil {
+		return false, false, err
+	}
+	bi, err := b.Stat()
+	if err != nil {
+		return false, false, err
+	}
+	return true, os.SameFile(ai, bi), nil
+}
+
+func checkOutputLinkName(string, string) error { return nil }
+
+func checkOutputUpLink(string, string, string) error { return nil }

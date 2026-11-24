@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"sort"
 	"strconv"
 	"time"
@@ -485,15 +486,18 @@ func videoFramesOf(part *partDesc) *videoFrames {
 			mediaTime = edit.mediaTime
 			edited = true
 			if edit.segmentDuration > 0 {
-				d := (uint64(edit.segmentDuration)*uint64(track.mdhdTimescale) + uint64(part.mvhdTimescale)/2) / uint64(part.mvhdTimescale)
-				if d > math.MaxInt64 || mediaTime > math.MaxInt64-int64(d) {
+				d, ok := bigRescaleHalfUp(new(big.Int).SetUint64(edit.segmentDuration), uint64(track.mdhdTimescale), uint64(part.mvhdTimescale))
+				if !ok || d < 0 || mediaTime > math.MaxInt64-d {
 					return nil
 				}
-				mediaEnd = mediaTime + int64(d)
+				mediaEnd = mediaTime + d
 			}
 		}
 	}
-	emptyTicks := int64((uint64(empty)*uint64(track.mdhdTimescale) + uint64(part.mvhdTimescale)/2) / uint64(part.mvhdTimescale))
+	emptyTicks, ok := bigRescaleHalfUp(big.NewInt(empty), uint64(track.mdhdTimescale), uint64(part.mvhdTimescale))
+	if !ok {
+		return nil
+	}
 	inEdit := func(cts int64) bool { return cts >= mediaTime && cts < mediaEnd }
 	origin := int64(0)
 	if edited {
@@ -561,23 +565,36 @@ func videoFramesOf(part *partDesc) *videoFrames {
 	return &videoFrames{uint64(track.mdhdTimescale), starts, end, nominal}
 }
 
-func videoTimeUS(v *videoFrames, k int) (int64, bool) {
-	if k < 0 || k >= len(v.starts) {
+func bigRescaleHalfUp(val *big.Int, mul, div uint64) (int64, bool) {
+	if div == 0 {
 		return 0, false
 	}
-	n := int64(v.starts[k]) * 1_000_000
-	d := int64(v.timescale)
-	q := (absInt64(n)*2 + d) / (2 * d)
-	if n < 0 {
-		q = -q
+	num := new(big.Int).Mul(val, new(big.Int).SetUint64(mul))
+	num.Add(num, new(big.Int).SetUint64(div/2))
+	num.Quo(num, new(big.Int).SetUint64(div))
+	if !num.IsInt64() {
+		return 0, false
 	}
-	return q, true
+	return num.Int64(), true
 }
-func absInt64(n int64) int64 {
-	if n < 0 {
-		return -n
+
+func videoTimeUS(v *videoFrames, k int) (int64, bool) {
+	if k < 0 || k >= len(v.starts) || v.timescale == 0 {
+		return 0, false
 	}
-	return n
+	n := new(big.Int).Mul(big.NewInt(v.starts[k]), big.NewInt(1_000_000))
+	d := new(big.Int).SetUint64(v.timescale)
+	absN := new(big.Int).Abs(n)
+	num := new(big.Int).Add(new(big.Int).Lsh(absN, 1), d)
+	den := new(big.Int).Lsh(d, 1)
+	q := new(big.Int).Quo(num, den)
+	if n.Sign() < 0 {
+		q.Neg(q)
+	}
+	if !q.IsInt64() {
+		return 0, false
+	}
+	return q.Int64(), true
 }
 
 func segmentTableCovers(t *segmentTable, part *partDesc) error {
@@ -596,12 +613,15 @@ func segmentTableCovers(t *segmentTable, part *partDesc) error {
 			return fmt.Errorf("segment starts at %d µs, video at %d µs", s.outStartUS, tm)
 		}
 	}
-	endUS := int64(last.outStartUS + last.durationUS)
-	left := 2*endUS*int64(v.timescale) - 2*v.end*1_000_000
-	if left < 0 {
-		left = -left
-	}
-	if left > 2*v.nominal*1_000_000+int64(v.timescale) {
+	ts := new(big.Int).SetUint64(v.timescale)
+	endUS := new(big.Int).Add(big.NewInt(last.outStartUS), big.NewInt(last.durationUS))
+	// diff = |2 * endUS * timescale - 2 * v.end * 1_000_000|
+	lhs := new(big.Int).Mul(big.NewInt(2), new(big.Int).Mul(endUS, ts))
+	rhs := new(big.Int).Mul(big.NewInt(2_000_000), big.NewInt(v.end))
+	diff := new(big.Int).Abs(new(big.Int).Sub(lhs, rhs))
+	// limit = 2 * v.nominal * 1_000_000 + timescale
+	limit := new(big.Int).Add(new(big.Int).Mul(big.NewInt(2_000_000), big.NewInt(v.nominal)), ts)
+	if diff.Cmp(limit) > 0 {
 		return fmt.Errorf("segment table ends more than a frame from video end")
 	}
 	return nil

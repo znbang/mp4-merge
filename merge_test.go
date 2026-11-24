@@ -219,45 +219,65 @@ func TestJoinSelectsMdatContainingTrackChunks(t *testing.T) {
 	}
 }
 
+func makeTestStarts(ticks []uint64) *trackStarts {
+	exact := make([]*big.Int, len(ticks))
+	for i, v := range ticks {
+		exact[i] = biU64(v)
+	}
+	return &trackStarts{ticks: ticks, exact: exact, timescale: 1}
+}
+
 func TestMergeEditsCutsOverlapAtSeparateRecording(t *testing.T) {
-	track := func(editDuration uint64) *partTrack {
-		return &partTrack{
+	track := func(mediaDur, editDuration uint64) partTrack {
+		stsd := make([]byte, 8)
+		binary.BigEndian.PutUint32(stsd[4:], 1)
+		return partTrack{
+			handler:       fourCC("vide"),
+			tkhdDuration:  editDuration,
 			mdhdTimescale: 1000,
-			stts:          [][2]uint32{{1, 1000}},
+			mdhdDuration:  mediaDur,
+			stsd:          stsd,
+			sampleEntries: []sampleEntry{{format: fourCC("avc1"), at: 8}},
+			stts:          [][2]uint32{{1, uint32(mediaDur)}},
 			stszCount:     1,
+			stsz:          []uint32{1},
+			stsc:          [][3]uint32{{1, 1, 1}},
+			stco:          []uint64{0},
 			hasElst:       true,
 			elst:          []edit{{segmentDuration: editDuration, mediaTime: 0, mediaRate: mediaRateOne}},
 		}
 	}
-	tracks := []*partTrack{track(1200), track(1000)}
-	parts := []partDesc{{mvhdTimescale: 1000}, {mvhdTimescale: 1000}}
-	starts := []uint64{0, 1000}
-	continues := []bool{false}
-
-	edits, whole, duration, fills, lengthens, _, err := mergeEdits(tracks, parts, 1000, 1000, 2000, starts, continues, true, nil)
-	if err != nil {
-		t.Fatalf("mergeEdits failed: %v", err)
+	first := track(1200, 1200)
+	second := track(1000, 1000)
+	second.stco = []uint64{1}
+	movie := &movieInfo{
+		parts: []partDesc{
+			{mvhdTimescale: 1000, mvhdDuration: 1200, mdat: [2]uint64{0, 1}, tracks: []partTrack{first}},
+			{mvhdTimescale: 1000, mvhdDuration: 1000, mdat: [2]uint64{1, 1}, tracks: []partTrack{second}},
+		},
+		timescale: 1000,
+		continues: []bool{false},
+		ends:      []uint64{1000, 1000},
 	}
-	if whole {
-		t.Fatal("expected an edit list for the separate recording boundary")
+	filler := &mdatFillerState{at: 2}
+	merged, _, duration, err := mergeTrack(movie, 0, trackRole{kind: roleAligned, starts: makeTestStarts([]uint64{0, 1000})}, filler)
+	if err != nil {
+		t.Fatalf("mergeTrack failed: %v", err)
 	}
 	if duration != 2000 {
 		t.Fatalf("timeline duration = %d, want 2000", duration)
 	}
-	if len(fills) != 2 || fills[0] != 0 || fills[1] != 0 {
-		t.Fatalf("PCM fills = %v, want none", fills)
+	if len(filler.runs) != 0 {
+		t.Fatalf("PCM fills = %v, want none", filler.runs)
 	}
-	if len(lengthens) != 2 || lengthens[0] != 0 || lengthens[1] != 0 {
-		t.Fatalf("sample lengthenings = %v, want none", lengthens)
+	if len(merged.elst) != 2 {
+		t.Fatalf("got %d edits, want 2: %#v", len(merged.elst), merged.elst)
 	}
-	if len(edits) != 2 {
-		t.Fatalf("got %d edits, want 2: %#v", len(edits), edits)
+	if merged.elst[0].segmentDuration != 1000 || merged.elst[0].mediaTime != 0 {
+		t.Fatalf("first edit = %#v, want 1000 ticks at media time 0", merged.elst[0])
 	}
-	if edits[0].segmentDuration != 1000 || edits[0].mediaTime != 0 {
-		t.Fatalf("first edit = %#v, want 1000 ticks at media time 0", edits[0])
-	}
-	if edits[1].segmentDuration != 1000 || edits[1].mediaTime != 1000 {
-		t.Fatalf("second edit = %#v, want 1000 ticks at media time 1000", edits[1])
+	if merged.elst[1].segmentDuration != 1000 || merged.elst[1].mediaTime != 1200 {
+		t.Fatalf("second edit = %#v, want 1000 ticks at media time 1200", merged.elst[1])
 	}
 }
 
@@ -280,18 +300,25 @@ func TestMergeTrackCutsSoundAtSampleBoundary(t *testing.T) {
 		}
 	}
 	first, second := makeTrack(0), makeTrack(2)
-	desc := &desc{parts: []partDesc{
-		{mvhdTimescale: 1000, mvhdDuration: 2000, mdat: [2]uint64{0, 2}, tracks: []partTrack{first}},
-		{mvhdTimescale: 1000, mvhdDuration: 2000, mdat: [2]uint64{2, 2}, tracks: []partTrack{second}},
-	}, movieTimescale: 1000, mdatOffset: 4}
-	merged, _, err := mergeTrack(desc, 0, 1000, []uint64{0, 1500}, []bool{false})
+	movie := &movieInfo{
+		parts: []partDesc{
+			{mvhdTimescale: 1000, mvhdDuration: 2000, mdat: [2]uint64{0, 2}, tracks: []partTrack{first}},
+			{mvhdTimescale: 1000, mvhdDuration: 2000, mdat: [2]uint64{2, 2}, tracks: []partTrack{second}},
+		},
+		timescale: 1000,
+		continues: []bool{false},
+		ends:      []uint64{1400, 2000},
+	}
+	// Overlap of 600 > 400 lost: cuts sample 2 at boundary and lengthens sample 1 over the 400-tick gap.
+	filler := &mdatFillerState{at: 4}
+	merged, _, _, err := mergeTrack(movie, 0, trackRole{kind: roleAligned, starts: makeTestStarts([]uint64{0, 1400})}, filler)
 	if err != nil {
 		t.Fatalf("mergeTrack failed: %v", err)
 	}
-	if merged.stszCount != 3 || merged.mdhdDuration != 3500 {
-		t.Fatalf("merged samples=%d media duration=%d; want 3 samples and 3500 ticks", merged.stszCount, merged.mdhdDuration)
+	if merged.stszCount != 3 || merged.mdhdDuration != 3400 {
+		t.Fatalf("merged samples=%d media duration=%d; want 3 samples and 3400 ticks", merged.stszCount, merged.mdhdDuration)
 	}
-	if len(merged.stts) != 2 || merged.stts[0] != [2]uint32{1, 1500} || merged.stts[1] != [2]uint32{2, 1000} {
+	if len(merged.stts) != 2 || merged.stts[0] != [2]uint32{1, 1400} || merged.stts[1] != [2]uint32{2, 1000} {
 		t.Fatalf("merged stts=%v; want first kept sample extended over the gap", merged.stts)
 	}
 	if len(merged.stco) != 2 || len(merged.stsc) != 2 || merged.stsc[0] != [3]uint32{1, 1, 1} || merged.stsc[1] != [3]uint32{2, 2, 1} {
@@ -346,18 +373,7 @@ func TestPCMGapsProduceSilenceSamples(t *testing.T) {
 	if pcm == nil || pcm.frame != 4 || pcm.byte != 0 {
 		t.Fatalf("PCM frame description = %#v, want 4-byte little-endian PCM silence", pcm)
 	}
-	parts := []partDesc{{mvhdTimescale: 1000}, {mvhdTimescale: 1000}}
-	edits, whole, duration, fills, lengthens, _, err := mergeEdits(tracks, parts, 1000, 1000, 20, []uint64{0, 15}, []bool{false}, true, pcm)
-	if err != nil {
-		t.Fatalf("mergeEdits failed: %v", err)
-	}
-	if !whole || duration != 25 || len(edits) != 1 || edits[0].segmentDuration != 25 || fills[0] != 5 {
-		t.Fatalf("edits=%#v whole=%v duration=%d fills=%v; want one 25-tick edit with five silence samples", edits, whole, duration, fills)
-	}
-	if lengthens[0] != 0 || lengthens[1] != 0 {
-		t.Fatalf("PCM silence should not lengthen a source sample: %v", lengthens)
-	}
-	groups, compact, err := mergeSampleGroups(tracks, fills, "PCM test")
+	groups, compact, err := mergeSampleGroups(tracks, []uint32{5, 0}, "PCM test")
 	if err != nil {
 		t.Fatalf("mergeSampleGroups failed: %v", err)
 	}
@@ -367,17 +383,25 @@ func TestPCMGapsProduceSilenceSamples(t *testing.T) {
 
 	second := *tracks[1]
 	second.stco = []uint64{40}
-	parts = []partDesc{
-		{mvhdTimescale: 1000, mvhdDuration: 15, mdat: [2]uint64{0, 40}, tracks: []partTrack{*tracks[0]}},
-		{mvhdTimescale: 1000, mvhdDuration: 15, mdat: [2]uint64{40, 40}, tracks: []partTrack{second}},
+	movie := &movieInfo{
+		parts: []partDesc{
+			{mvhdTimescale: 1000, mvhdDuration: 15, mdat: [2]uint64{0, 40}, tracks: []partTrack{*tracks[0]}},
+			{mvhdTimescale: 1000, mvhdDuration: 15, mdat: [2]uint64{40, 40}, tracks: []partTrack{second}},
+		},
+		timescale: 1000,
+		continues: []bool{false},
+		ends:      []uint64{15, 10},
 	}
-	desc := &desc{parts: parts, movieTimescale: 1000, mdatOffset: 80}
-	merged, _, err := mergeTrack(desc, 0, 1000, []uint64{0, 15}, []bool{false})
+	filler := &mdatFillerState{at: 80}
+	merged, _, _, err := mergeTrack(movie, 0, trackRole{kind: roleAligned, starts: makeTestStarts([]uint64{0, 15})}, filler)
 	if err != nil {
 		t.Fatalf("mergeTrack failed: %v", err)
 	}
 	if merged.stszCount != 25 || merged.stszSampleSize != 4 || merged.mdhdDuration != 25 || len(merged.stts) != 1 || merged.stts[0] != [2]uint32{25, 1} {
 		t.Fatalf("merged PCM tables: sample count=%d size=%d mdhd=%d stts=%v", merged.stszCount, merged.stszSampleSize, merged.mdhdDuration, merged.stts)
+	}
+	if len(merged.elst) != 1 || merged.elst[0].segmentDuration != 25 {
+		t.Fatalf("merged PCM elst = %#v, want single 25-tick edit", merged.elst)
 	}
 	if len(merged.stco) != 3 || merged.stco[0] != 0 || merged.stco[1] != 80 || merged.stco[2] != 40 {
 		t.Fatalf("merged PCM chunk offsets = %v, want source, silence, next source", merged.stco)
@@ -385,55 +409,82 @@ func TestPCMGapsProduceSilenceSamples(t *testing.T) {
 	if len(merged.stsc) != 3 || merged.stsc[0][0] != 1 || merged.stsc[1][0] != 2 || merged.stsc[2][0] != 3 {
 		t.Fatalf("merged PCM chunk map = %v", merged.stsc)
 	}
-	if len(desc.mdatFiller) != 1 || desc.mdatFiller[0] != (fill{length: 20, value: 0}) {
-		t.Fatalf("mdat silence = %v, want 20 zero bytes", desc.mdatFiller)
+	if len(filler.runs) != 1 || filler.runs[0] != (fill{length: 20, value: 0}) {
+		t.Fatalf("mdat silence = %v, want 20 zero bytes", filler.runs)
 	}
 }
 
 func TestGapLengthensLastCodedSample(t *testing.T) {
-	track := func() *partTrack {
-		return &partTrack{
+	makeTrack := func(off uint64) partTrack {
+		stsd := make([]byte, 8)
+		binary.BigEndian.PutUint32(stsd[4:], 1)
+		return partTrack{
 			handler:       fourCC("soun"),
+			tkhdDuration:  10,
 			mdhdTimescale: 1000,
 			mdhdDuration:  10,
+			stsd:          stsd,
+			sampleEntries: []sampleEntry{{format: fourCC("mp4a"), at: 8}},
 			stts:          [][2]uint32{{1, 10}},
 			stszCount:     1,
+			stsz:          []uint32{1},
+			stsc:          [][3]uint32{{1, 1, 1}},
+			stco:          []uint64{off},
 		}
 	}
-	tracks := []*partTrack{track(), track()}
-	parts := []partDesc{{mvhdTimescale: 1000}, {mvhdTimescale: 1000}}
-	edits, whole, duration, fills, lengthens, _, err := mergeEdits(tracks, parts, 1000, 1000, 20, []uint64{0, 15}, []bool{false}, true, nil)
+	movie := &movieInfo{
+		parts: []partDesc{
+			{mvhdTimescale: 1000, mvhdDuration: 15, mdat: [2]uint64{0, 1}, tracks: []partTrack{makeTrack(0)}},
+			{mvhdTimescale: 1000, mvhdDuration: 10, mdat: [2]uint64{1, 1}, tracks: []partTrack{makeTrack(1)}},
+		},
+		timescale: 1000,
+		continues: []bool{false},
+		ends:      []uint64{15, 10},
+	}
+	filler := &mdatFillerState{at: 2}
+	merged, _, _, err := mergeTrack(movie, 0, trackRole{kind: roleAligned, starts: makeTestStarts([]uint64{0, 15})}, filler)
 	if err != nil {
-		t.Fatalf("mergeEdits failed: %v", err)
+		t.Fatalf("mergeTrack failed: %v", err)
 	}
-	if !whole || duration != 25 || len(edits) != 1 || edits[0].segmentDuration != 25 || fills[0] != 0 || lengthens[0] != 5 {
-		t.Fatalf("edits=%#v whole=%v duration=%d fills=%v lengthens=%v", edits, whole, duration, fills, lengthens)
-	}
-	runs, err := lengthenLastRun([][2]uint32{{1, 10}}, lengthens[0])
-	if err != nil || len(runs) != 1 || runs[0] != [2]uint32{1, 15} {
-		t.Fatalf("lengthened stts = %v, err=%v; want one 15-tick sample", runs, err)
+	if merged.mdhdDuration != 25 || len(merged.stts) != 2 || merged.stts[0] != [2]uint32{1, 15} || merged.stts[1] != [2]uint32{1, 10} {
+		t.Fatalf("lengthened stts = %v, mdhd = %d; want [1x15, 1x10] and 25", merged.stts, merged.mdhdDuration)
 	}
 }
 
 func TestUnfilledOneTickSoundLeavesGapOut(t *testing.T) {
-	track := func() *partTrack {
-		return &partTrack{
+	makeTrack := func(off uint64) partTrack {
+		stsd := make([]byte, 8)
+		binary.BigEndian.PutUint32(stsd[4:], 1)
+		return partTrack{
 			handler:        fourCC("soun"),
+			tkhdDuration:   10,
 			mdhdTimescale:  1000,
 			mdhdDuration:   10,
+			stsd:           stsd,
+			sampleEntries:  []sampleEntry{{format: fourCC("mp4a"), at: 8}},
 			stts:           [][2]uint32{{10, 1}},
 			stszCount:      10,
 			stszSampleSize: 2,
+			stsc:           [][3]uint32{{1, 10, 1}},
+			stco:           []uint64{off},
 		}
 	}
-	tracks := []*partTrack{track(), track()}
-	parts := []partDesc{{mvhdTimescale: 1000}, {mvhdTimescale: 1000}}
-	edits, whole, duration, fills, lengthens, _, err := mergeEdits(tracks, parts, 1000, 1000, 20, []uint64{0, 15}, []bool{false}, true, nil)
-	if err != nil {
-		t.Fatalf("mergeEdits failed: %v", err)
+	movie := &movieInfo{
+		parts: []partDesc{
+			{mvhdTimescale: 1000, mvhdDuration: 15, mdat: [2]uint64{0, 20}, tracks: []partTrack{makeTrack(0)}},
+			{mvhdTimescale: 1000, mvhdDuration: 10, mdat: [2]uint64{20, 20}, tracks: []partTrack{makeTrack(20)}},
+		},
+		timescale: 1000,
+		continues: []bool{false},
+		ends:      []uint64{15, 10},
 	}
-	if !whole || duration != 20 || len(edits) != 1 || edits[0].segmentDuration != 20 || fills[0] != 0 || lengthens[0] != 0 {
-		t.Fatalf("unfilled one-tick sound should leave the gap out: edits=%#v whole=%v duration=%d fills=%v lengthens=%v", edits, whole, duration, fills, lengthens)
+	filler := &mdatFillerState{at: 40}
+	merged, _, _, err := mergeTrack(movie, 0, trackRole{kind: roleAligned, starts: makeTestStarts([]uint64{0, 15})}, filler)
+	if err != nil {
+		t.Fatalf("mergeTrack failed: %v", err)
+	}
+	if merged.mdhdDuration != 20 || len(merged.stts) != 1 || merged.stts[0] != [2]uint32{20, 1} || len(filler.runs) != 0 {
+		t.Fatalf("unfilled one-tick sound should leave the gap out: mdhd=%d stts=%v filler=%v", merged.mdhdDuration, merged.stts, filler.runs)
 	}
 }
 
